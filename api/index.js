@@ -1,113 +1,90 @@
-// /api/index.js
-import express from 'express';
-import { Readable } from 'stream';
+export default async function handler(req, res) {
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-const app = express();
-
-const TARGET_API_URL = 'https://generativelanguage.googleapis.com';
-const TARGET_HOSTNAME = new URL(TARGET_API_URL).hostname;
-const TARGET_ORIGIN = new URL(TARGET_API_URL).origin;
-
-app.all('*', async (req, res) => {
-  if (req.url === '/') { // (新增對根路徑的判斷)
-    return res.send('proxy is running, you can see more at https://github.com/spectre-pro/gemini-proxy'); // (如果是根路徑，返回指定訊息並結束請求)
-  } 
-  const targetUrl = `${TARGET_API_URL}${req.url}`;
-  
-  console.log(`\n==================== 新的代理請求 ====================`);
-  console.log(`[${new Date().toISOString()}]`);
-  console.log(`代理請求: ${req.method} ${req.url}`);
-  console.log(`轉發目標: ${targetUrl}`);
-  console.log(`--- 原始請求標頭 (Raw Request Headers) ---`);
-  // 使用 JSON.stringify(obj, null, 2) 可以讓輸出的物件格式更美觀，方便閱讀
-  console.log(JSON.stringify(req.headers, null, 2));
-  console.log(`------------------------------------------`);
-
-  let rawApiKeys = '';
-  let apiKeySource = ''; // 用來記錄金鑰來源: 'x-goog' 或 'auth'
-
-  if (req.headers['x-goog-api-key']) {
-    rawApiKeys = req.headers['x-goog-api-key'];
-    apiKeySource = 'x-goog';
-    console.log('在 x-goog-api-key 標頭中找到 API 金鑰');
-  } 
-  else if (req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('bearer ')) {
-    rawApiKeys = req.headers.authorization.substring(7); 
-    apiKeySource = 'auth';
-    console.log('在 Authorization 標頭中找到 API 金鑰');
+  // Handle OPTIONS (preflight) requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
 
-  let selectedKey = '';
-  if (apiKeySource) {
-    const apiKeys = String(rawApiKeys).split(',').map(k => k.trim()).filter(k => k);
-    if (apiKeys.length > 0) {
-      selectedKey = apiKeys[Math.floor(Math.random() * apiKeys.length)];
-      console.log(`Gemini Selected API Key: ${selectedKey}`);
-    }
-  }
-
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lowerKey = key.toLowerCase();
-    if (lowerKey !== 'x-goog-api-key' && lowerKey !== 'authorization') {
-      headers[key] = value;
-    }
-  }
-
-  // 根據金鑰來源，將選擇的金鑰以正確的標頭格式加回去
-  if (selectedKey) {
-    if (apiKeySource === 'x-goog') {
-      headers['x-goog-api-key'] = selectedKey;
-    } else if (apiKeySource === 'auth') {
-      headers['Authorization'] = `Bearer ${selectedKey}`;
-    }
-  }
-
-  headers.host = TARGET_HOSTNAME;
-  headers.origin = TARGET_ORIGIN;
-  headers.referer = TARGET_API_URL;
-  
-  headers['x-forwarded-for'] = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'] || req.protocol;
-
-  const hopByHopHeaders = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade'
-  ];
-  for (const header of hopByHopHeaders) {
-    delete headers[header];
+  // Only accept POST requests
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    const apiResponse = await fetch(targetUrl, {
-      method: req.method,
-      headers: headers,
-      body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
-      duplex: 'half',
+    // Get API key from environment variable
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'API key not configured' });
+    }
+
+    const { messages, model = 'gemini-2.5-pro' } = req.body;
+
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Messages array required' });
+    }
+
+    // Format messages for Gemini API
+    const contents = messages
+      .filter(msg => msg.role !== 'system')
+      .map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: msg.content }]
+      }));
+
+    // Extract system prompt if present
+    const systemPrompt = messages.find(msg => msg.role === 'system')?.content || '';
+
+    // Call Gemini API
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const geminiResponse = await fetch(geminiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        system_instruction: systemPrompt,
+        contents: contents,
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 1024,
+        },
+      }),
     });
 
-    // 將目標 API 的回應頭部轉發給客戶端
-    // 過濾掉不應直接轉發的標頭
-    const responseHeaders = {};
-    for (const [key, value] of apiResponse.headers.entries()) {
-      if (!['content-encoding', 'transfer-encoding', 'connection', 'strict-transport-security'].includes(key.toLowerCase())) {
-        responseHeaders[key] = value;
-      }
-    }
-    res.writeHead(apiResponse.status, responseHeaders);
+    const geminiData = await geminiResponse.json();
 
-    // 將目標 API 的回應流式傳輸回客戶端
-    if (apiResponse.body) {
-      Readable.fromWeb(apiResponse.body).pipe(res);
-    } else {
-      res.end();
+    // Handle API errors
+    if (!geminiResponse.ok) {
+      console.error('Gemini API error:', geminiData);
+      return res.status(geminiResponse.status).json({
+        error: geminiData.error?.message || 'Gemini API error',
+      });
     }
+
+    // Extract response text
+    const responseText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || 'No response';
+
+    // Format response in OpenAI-compatible format for JanitorAI
+    return res.status(200).json({
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: responseText,
+          },
+        },
+      ],
+    });
   } catch (error) {
-    console.error(`代理請求時發生錯誤:`, error);
-    if (!res.headersSent) {
-      res.status(502).send('代理伺服器錯誤 (Bad Gateway)');
-    }
+    console.error('Proxy error:', error);
+    return res.status(500).json({
+      error: 'Internal server error',
+      message: error.message,
+    });
   }
-});
-
-export default app;
+}
